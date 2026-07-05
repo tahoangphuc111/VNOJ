@@ -11,9 +11,9 @@ from django.views.decorators.clickjacking import xframe_options_sameorigin
 
 from judge.feed import AtomBlogFeed, AtomCommentFeed, AtomProblemFeed, BlogFeed, CommentFeed, ProblemFeed
 from judge.sitemap import sitemaps
-from judge.views import TitledTemplateView, api, blog, comment, contests, language, license, mailgun, organization, \
-    preview, problem, problem_download, problem_manage, ranked_submission, register, stats, status, submission, tag, \
-    tasks, ticket, two_factor, user, widgets
+from judge.views import TitledTemplateView, api, blog, comment, contests, language, license, mailgun, notification, \
+    organization, preview, problem, problem_download, problem_manage, ranked_submission, register, stats, status, \
+    submission, tag, tasks, ticket, two_factor, user, widgets
 from judge.views.magazine import MagazinePage
 from judge.views.misc_config import MiscConfigEdit
 from judge.views.problem_data import ProblemDataView, ProblemSubmissionDiff, \
@@ -113,8 +113,6 @@ urlpatterns = [
     path('problems', include([
         path('/', problem.ProblemList.as_view(), name='problem_list'),
         path('/random/', problem.RandomProblem.as_view(), name='problem_random'),
-        path('/suggest_list/', problem.SuggestList.as_view(), name='problem_suggest_list'),
-        path('/suggest', problem.ProblemSuggest.as_view(), name='problem_suggest'),
         path('/create', problem.ProblemCreate.as_view(), name='problem_create'),
         path('/import-polygon', problem.ProblemImportPolygon.as_view(), name='problem_import_polygon'),
     ])),
@@ -300,10 +298,14 @@ urlpatterns = [
         path('/join', organization.JoinOrganization.as_view(), name='join_organization'),
         path('/leave', organization.LeaveOrganization.as_view(), name='leave_organization'),
         path('/edit', organization.EditOrganization.as_view(), name='edit_organization'),
+        path('/quota/add', organization.OrganizationQuotaAdd.as_view(), name='organization_quota_add'),
+        path('/quota/<int:quota_id>/delete', organization.OrganizationQuotaDelete.as_view(),
+             name='organization_quota_delete'),
         path('/kick', organization.KickUserWidgetView.as_view(), name='organization_user_kick'),
-        path('/usage', organization.MonthlyCreditUsageOrganization.as_view(), name='organization_monthly_usage'),
-        path('/storage', organization.OrganizationStorageDashboard.as_view(), name='organization_storage'),
+        path('/usage', organization.OrganizationStorageDashboard.as_view(), name='organization_monthly_usage'),
         path('/problems/', organization.ProblemListOrganization.as_view(), name='problem_list_organization'),
+        path('/problems/bulk-delete', organization.BulkDeleteOrganizationProblems.as_view(),
+             name='organization_problems_bulk_delete'),
         path('/contests/', organization.ContestListOrganization.as_view(), name='contest_list_organization'),
         path('/submissions/',
              paged_list_view(organization.SubmissionListOrganization, 'submission_list_organization')),
@@ -406,6 +408,12 @@ urlpatterns = [
         path('new', ticket.NewIssueTicketView.as_view(), name='new_issue_ticket'),
     ])),
 
+    path('notifications/', include([
+        path('', notification.NotificationList.as_view(), name='notification_list'),
+        path('ajax', notification.NotificationAjax.as_view(), name='notification_ajax'),
+        path('mark_read', notification.NotificationMarkRead.as_view(), name='notification_mark_read'),
+    ])),
+
     path('ticket/<int:pk>', include([
         path('', ticket.TicketView.as_view(), name='ticket'),
         path('/ajax', ticket.TicketMessageDataAjax.as_view(), name='ticket_message_ajax'),
@@ -452,24 +460,6 @@ if 'newsletter' in settings.INSTALLED_APPS:
     urlpatterns.append(path('newsletter/', include('newsletter.urls')))
 if 'impersonate' in settings.INSTALLED_APPS:
     urlpatterns.append(path('impersonate/', include('impersonate.urls')))
-
-if settings.VNOJ_ENABLE_API:
-    urlpatterns.append(
-        path('api/v2/', include([
-            path('contests', api.api_v2.APIContestList.as_view()),
-            path('contest/<str:contest>', api.api_v2.APIContestDetail.as_view()),
-            path('problems', api.api_v2.APIProblemList.as_view()),
-            path('problem/<str:problem>', api.api_v2.APIProblemDetail.as_view()),
-            path('users', api.api_v2.APIUserList.as_view()),
-            path('user/<str:user>', api.api_v2.APIUserDetail.as_view()),
-            path('submissions', api.api_v2.APISubmissionList.as_view()),
-            path('submission/<int:submission>', api.api_v2.APISubmissionDetail.as_view()),
-            path('organizations', api.api_v2.APIOrganizationList.as_view()),
-            path('participations', api.api_v2.APIContestParticipationList.as_view()),
-            path('languages', api.api_v2.APILanguageList.as_view()),
-            path('judges', api.api_v2.APIJudgeList.as_view()),
-        ])),
-    )
 
 if settings.VNOJ_ENABLE_SYNC_API:
     urlpatterns.append(

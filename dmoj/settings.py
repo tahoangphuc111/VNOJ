@@ -54,8 +54,7 @@ VNOJ_ORG_PP_STEP = 0.95
 VNOJ_ORG_PP_ENTRIES = 100
 VNOJ_ORG_PP_SCALE = 1
 
-VNOJ_ENABLE_API = False
-VNOJ_ENABLE_SYNC_API = True  # need to make this true for testing :sad:
+VNOJ_ENABLE_SYNC_API = False
 GLOBAL_API_KEY = 'test-api-key-123'
 
 VNOJ_OFFICIAL_CONTEST_MODE = False
@@ -64,7 +63,6 @@ VNOJ_OFFICIAL_CONTEST_MODE = False
 # Both should be int
 VNOJ_CP_COMMENT = 1   # Each comment vote equals 1 CP
 VNOJ_CP_TICKET = 10   # Each good ticket equals CP
-VNOJ_CP_PROBLEM = 20  # Each suggested problem equal 20 CP
 
 TICKET_AUTOFILL_REPLIES = [
     {'en': 'No comments',
@@ -154,7 +152,18 @@ VNOJ_ENABLE_ORGANIZATION_CREDIT_LIMITATION = False
 VNOJ_MONTHLY_FREE_CREDIT = 3 * 60 * 60
 VNOJ_PRICE_PER_HOUR = 50
 
-
+# Organization quota limits
+VNOJ_ORGANIZATION_DEFAULT_MAX_PROBLEMS = 1000
+VNOJ_ORGANIZATION_DEFAULT_MAX_STORAGE = 5 * 1024 * 1024 * 1024  # 5GB
+# Suffix appended to every inline quota-warning message. May contain HTML (e.g. a link to a guide).
+# Example: ' <a href="https://example.com/quota-guide">Read our guide</a>.'
+VNOJ_QUOTA_WARNING_SUFFIX = ''
+VNOJ_QUOTA_WARNING_THRESHOLD = 0.8
+# When False, quota warnings are shown but users are NOT blocked from creating problems
+# or uploading test data. Set to True to enforce hard limits.
+VNOJ_QUOTA_ENFORCEMENT_ENABLED = False
+VNOJ_QUOTA_PACKAGE_STORAGE = 5 * 1024 * 1024 * 1024  # 5 GB per package
+VNOJ_QUOTA_PACKAGE_PROBLEMS = 1000  # problems per package
 VNOJ_LONG_QUEUE_ALERT_THRESHOLD = 10
 
 # Low power mode: Optimize queries by limiting data scope for performance
@@ -230,7 +239,6 @@ DISCORD_WEBHOOK = {
     'on_new_ticket': None,
     'on_new_comment': None,
     'on_new_problem': None,
-    'on_new_suggested_problem': None,
     'on_new_tag_problem': None,
     'on_new_tag': None,
     'on_new_blogpost': None,
@@ -327,6 +335,10 @@ DMOJ_THEME_DEFAULT_ACE_THEME = {
     'dark': 'twilight',
 }
 DMOJ_SELECT2_THEME = 'dmoj'
+
+# Cookie used to remember the site theme of anonymous (logged-out) users.
+SITE_THEME_COOKIE_NAME = 'site_theme'
+SITE_THEME_COOKIE_AGE = 60 * 60 * 24 * 365  # 1 year
 
 MARKDOWN_STYLES = {}
 MARKDOWN_DEFAULT_STYLE = {}
@@ -760,6 +772,7 @@ EVENT_DAEMON_AMQP_EXCHANGE = 'dmoj-events'
 EVENT_DAEMON_SUBMISSION_KEY = '6Sdmkx^%pk@GsifDfXcwX*Y7LRF%RGT8vmFpSxFBT$fwS7trc8raWfN#CSfQuKApx&$B#Gh2L7p%W!Ww'
 EVENT_DAEMON_CONTEST_KEY = '&w7hB-.9WnY2Jj^Qm+|?o6a<!}_2Wiw+?(_Yccqq{uR;:kWQP+3R<r(ICc|4^dDeEuJE{*D;Gg@K(4K>'
 EVENT_DAEMON_TICKET_KEY = '@R3DjH&egtm0HNhok6ERIMK!zlTzq2hrSGG2Se8SujCoO(2NX!DkbzcgQtm90FHDvpFM3gJ&D7acS$ta'
+EVENT_DAEMON_NOTIFICATION_KEY = 'm4l6v_%7j_%#abf&2#esiq@f_#2!cu54+gg%7y+g(fg--0=(hz'
 
 # Internationalization
 # https://docs.djangoproject.com/en/4.2/topics/i18n/

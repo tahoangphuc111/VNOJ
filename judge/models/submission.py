@@ -152,8 +152,6 @@ class Submission(models.Model):
             return True
         elif user.has_perm('judge.view_all_submission'):
             return True
-        elif not self.problem.is_public and user.has_perm('judge.suggest_new_problem') and self.problem.is_suggesting:
-            return True
         elif self.user_id == profile.id:
             return True
         elif source_visibility == SubmissionSourceAccess.ALWAYS:
@@ -287,6 +285,12 @@ class Submission(models.Model):
 
             # For user submissions page
             models.Index(fields=['user', '-id']),
+
+            # For submission heat map
+            models.Index(fields=['user', 'date']),
+
+            # For organization problem list: last submission time filter
+            models.Index(fields=['problem', '-date']),
         ]
 
 

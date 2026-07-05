@@ -1,3 +1,4 @@
+import datetime
 from functools import cached_property
 
 from django import forms
@@ -5,30 +6,32 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin, PermissionRequiredMixin
 from django.core.exceptions import ImproperlyConfigured, PermissionDenied
-from django.db.models import Count, FilteredRelation, Q, Sum
+from django.db.models import Count, FilteredRelation, OuterRef, Q, Subquery, Sum
 from django.db.models.expressions import F, Value
 from django.db.models.functions import Coalesce
 from django.forms import Form, modelformset_factory
 from django.http import Http404, HttpResponseRedirect
 from django.shortcuts import get_object_or_404, render
+from django.template.defaultfilters import filesizeformat
 from django.urls import reverse
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from django.utils.html import format_html
 from django.utils.translation import gettext as _, gettext_lazy, ngettext
 from django.views.generic import CreateView, DetailView, FormView, ListView, UpdateView, View
 from django.views.generic.detail import SingleObjectMixin, SingleObjectTemplateResponseMixin
 from reversion import revisions
 
-from judge.forms import OrganizationForm
+from judge.forms import OrganizationForm, QuotaGrantForm
 from judge.models import BlogPost, Comment, Contest, Language, Organization, OrganizationRequest, \
-    Problem, ProblemData, Profile
-from judge.models.profile import OrganizationMonthlyUsage
+    Problem, Profile, Submission
+from judge.models.profile import OrganizationMonthlyUsage, OrganizationQuota
 from judge.tasks import on_new_problem
-from judge.utils import cache_helper
+from judge.utils.cache_helper import storage_pie_cache_factory
 from judge.utils.infinite_paginator import InfinitePaginationMixin
-from judge.utils.organization import add_admin_to_group
+from judge.utils.organization import add_admin_to_group, add_quota_context
 from judge.utils.ranker import ranker
-from judge.utils.stats import get_lines_chart
+from judge.utils.stats import get_lines_chart, get_pie_chart
 from judge.utils.views import DiggPaginatorMixin, QueryStringSortMixin, TitleMixin, generic_message, \
     paginate_query_context
 from judge.views.blog import BlogPostCreate, PostListBase
@@ -39,7 +42,11 @@ from judge.views.submission import SubmissionsListBase
 __all__ = ['OrganizationList', 'OrganizationHome', 'OrganizationUsers', 'OrganizationMembershipChange',
            'JoinOrganization', 'LeaveOrganization', 'EditOrganization', 'RequestJoinOrganization',
            'OrganizationRequestDetail', 'OrganizationRequestView', 'OrganizationRequestLog',
-           'KickUserWidgetView', 'OrganizationStorageDashboard']
+           'KickUserWidgetView', 'OrganizationStorageDashboard',
+           'OrganizationQuotaAdd', 'OrganizationQuotaDelete']
+
+
+MAX_BULK_DELETE_PROBLEMS = 200
 
 
 class OrganizationMixin(object):
@@ -54,7 +61,7 @@ class OrganizationMixin(object):
 
     @cached_property
     def organization(self):
-        return get_object_or_404(Organization, slug=self.kwargs['slug'])
+        return get_object_or_404(Organization.objects.prefetch_related('admins__user'), slug=self.kwargs['slug'])
 
     def dispatch(self, request, *args, **kwargs):
         if 'slug' not in kwargs:
@@ -390,6 +397,11 @@ class CreateOrganization(PermissionRequiredMixin, TitleMixin, CreateView):
     def get_title(self):
         return _('Create new organization')
 
+    def get_form_kwargs(self):
+        kwargs = super().get_form_kwargs()
+        kwargs['request'] = self.request
+        return kwargs
+
     def form_valid(self, form):
         with revisions.create_revision(atomic=True):
             revisions.set_comment(_('Created on site'))
@@ -433,6 +445,13 @@ class EditOrganization(LoginRequiredMixin, TitleMixin, AdminOrganizationMixin, U
             raise PermissionDenied()
         return object
 
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        if self.request.user.has_perm('judge.add_organizationquota'):
+            context['quota_form'] = QuotaGrantForm()
+            context['existing_quotas'] = self.organization.quotas.order_by('start_date')
+        return context
+
     def form_valid(self, form):
         with revisions.create_revision(atomic=True):
             revisions.set_comment(_('Edited from site'))
@@ -444,6 +463,34 @@ class EditOrganization(LoginRequiredMixin, TitleMixin, AdminOrganizationMixin, U
         kwargs = super().get_form_kwargs()
         kwargs['request'] = self.request  # Pass the request object to the form
         return kwargs
+
+
+class OrganizationQuotaAdd(LoginRequiredMixin, AdminOrganizationMixin, View):
+    def post(self, request, *args, **kwargs):
+        if not request.user.has_perm('judge.add_organizationquota'):
+            raise PermissionDenied()
+        form = QuotaGrantForm(request.POST)
+        if form.is_valid():
+            packages = form.cleaned_data['packages']
+            OrganizationQuota.objects.create(
+                organization=self.organization,
+                start_date=form.cleaned_data['start_date'],
+                end_date=form.cleaned_data['end_date'],
+                added_problems=packages * settings.VNOJ_QUOTA_PACKAGE_PROBLEMS,
+                added_storage=packages * settings.VNOJ_QUOTA_PACKAGE_STORAGE,
+            )
+        return HttpResponseRedirect(reverse('edit_organization', args=[self.organization.slug]))
+
+
+class OrganizationQuotaDelete(LoginRequiredMixin, AdminOrganizationMixin, View):
+    def post(self, request, *args, **kwargs):
+        # We use `add_organizationquota` permission to indicate that this user has all edit permissions.
+        # I don't want to make this too complex.
+        if not request.user.has_perm('judge.add_organizationquota'):
+            raise PermissionDenied()
+        quota_id = kwargs.get('quota_id')
+        OrganizationQuota.objects.filter(id=quota_id, organization=self.organization).delete()
+        return HttpResponseRedirect(reverse('edit_organization', args=[self.organization.slug]))
 
 
 class KickUserWidgetView(LoginRequiredMixin, AdminOrganizationMixin, SingleObjectMixin, View):
@@ -588,52 +635,52 @@ class ProblemListOrganization(PrivateOrganizationMixin, ProblemList):
         return _filter & Q(organization=self.organization)
 
 
-class MonthlyCreditUsageOrganization(LoginRequiredMixin, TitleMixin, AdminOrganizationMixin, ListView):
-    template_name = 'organization/usage.html'
+class BulkDeleteOrganizationProblems(LoginRequiredMixin, AdminOrganizationMixin, View):
+    def post(self, request, *args, **kwargs):
+        org = self.organization
+        problem_ids = request.POST.getlist('problem_ids')
+        if not problem_ids:
+            messages.warning(request, _('No problems selected for deletion.'))
+            return HttpResponseRedirect(reverse('organization_monthly_usage', args=[org.slug]))
 
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        context['title'] = self.organization.name
-        context['usages'] = OrganizationMonthlyUsage.objects.filter(organization=self.organization)\
-            .order_by('time').values('time', 'consumed_credit')
+        if len(problem_ids) > MAX_BULK_DELETE_PROBLEMS:
+            messages.error(request, _('Cannot delete more than %d problems at once.') % MAX_BULK_DELETE_PROBLEMS)
+            return HttpResponseRedirect(reverse('organization_monthly_usage', args=[org.slug]))
 
-        usages = context['usages']
-        days = [usage['time'].isoformat() for usage in usages] + [_('Current month')]
-        used_credits = [usage['consumed_credit'] for usage in usages] + [self.organization.current_consumed_credit]
-        sec_per_hour = 60 * 60
-        chart = get_lines_chart(days, {
-            _('Credit usage (hour)'): [
-                round(credit / sec_per_hour, 2) for credit in used_credits
-            ],
-        })
+        problems = Problem.available.filter(
+            id__in=problem_ids,
+            organization=org,
+        )
 
-        cost_chart = get_lines_chart(days, {
-            _('Cost (thousand vnd)'): [
-                round(
-                    max(0, credit - settings.VNOJ_MONTHLY_FREE_CREDIT) / sec_per_hour * settings.VNOJ_PRICE_PER_HOUR, 3,
-                ) for credit in used_credits
-            ],
-        })
+        if not request.user.is_superuser:
+            all_count = problems.count()
+            problems = problems.filter(Q(authors=request.profile) | Q(curators=request.profile))
+            skipped = all_count - problems.count()
+            if skipped > 0:
+                messages.error(request, ngettext(
+                    '%d problem was skipped because you are not its author.',
+                    '%d problems were skipped because you are not their author.',
+                    skipped,
+                ) % skipped)
 
-        free_credit = int(self.organization.free_credit)
+        count = problems.count()
+        if count > 0:
+            with revisions.create_revision(atomic=True):
+                for problem in problems:
+                    problem.mark_as_deleted(invalidate_storage_cache=False)
+                revisions.set_user(request.user)
+                revisions.set_comment(_('Bulk marked as deleted'))
 
-        context['free_credit'] = {
-            'hour': free_credit // sec_per_hour,
-            'minute': (free_credit % sec_per_hour) // 60,
-            'second': free_credit % 60,
-        }
+            storage_pie_cache_factory(org.id).delete_cache()
+            messages.success(request, ngettext(
+                'Successfully deleted %d problem.',
+                'Successfully deleted %d problems.',
+                count,
+            ) % count)
+        else:
+            messages.error(request, _('No valid problems could be deleted.'))
 
-        paid_credit = int(self.organization.paid_credit)
-
-        context['paid_credit'] = {
-            'hour': paid_credit // sec_per_hour,
-            'minute': (paid_credit % sec_per_hour) // 60,
-            'second': paid_credit % 60,
-        }
-
-        context['credit_chart'] = chart
-        context['cost_chart'] = cost_chart
-        return context
+        return HttpResponseRedirect(reverse('organization_monthly_usage', args=[org.slug]))
 
 
 class ContestListOrganization(PrivateOrganizationMixin, ContestList):
@@ -673,6 +720,25 @@ class SubmissionListOrganization(InfinitePaginationMixin, PrivateOrganizationMix
 class ProblemCreateOrganization(AdminOrganizationMixin, ProblemCreate):
     permission_required = 'judge.create_organization_problem'
 
+    def _quota_error_response(self):
+        return render(self.request, 'organization/quota-error.html', {
+            'title': _('Problem limit reached'),
+            'message': _('This organization has reached its maximum number of problems (%d). '
+                         'Please delete some problems before creating new ones.')
+            % self.organization.max_problems,
+            'quota_warning_suffix': settings.VNOJ_QUOTA_WARNING_SUFFIX,
+        })
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        add_quota_context(self.organization, context)
+        return context
+
+    def get(self, request, *args, **kwargs):
+        if settings.VNOJ_QUOTA_ENFORCEMENT_ENABLED and not self.organization.can_create_problem():
+            return self._quota_error_response()
+        return super().get(request, *args, **kwargs)
+
     def get_initial(self):
         initial = super(ProblemCreateOrganization, self).get_initial()
         initial = initial.copy()
@@ -685,6 +751,8 @@ class ProblemCreateOrganization(AdminOrganizationMixin, ProblemCreate):
         return kwargs
 
     def form_valid(self, form):
+        if settings.VNOJ_QUOTA_ENFORCEMENT_ENABLED and not self.organization.can_create_problem():
+            return self._quota_error_response()
         with revisions.create_revision(atomic=True):
             self.object = problem = form.save()
             problem.authors.add(self.request.user.profile)
@@ -751,12 +819,12 @@ class ContestCreateOrganization(AdminOrganizationMixin, CreateContest):
 class OrganizationStorageDashboard(LoginRequiredMixin, TitleMixin, AdminOrganizationMixin,
                                    InfinitePaginationMixin, ListView):
     """Dashboard showing storage usage for organization admins."""
-    template_name = 'organization/storage.html'
+    template_name = 'organization/usage.html'
     context_object_name = 'problems'
-    paginate_by = 100
+    paginate_by = MAX_BULK_DELETE_PROBLEMS
 
     def get_title(self):
-        return _('Storage Dashboard - %s') % self.organization.name
+        return _('Organization cost - %s') % self.organization.name
 
     def get_queryset(self):
         queryset = Problem.available.filter(
@@ -765,32 +833,150 @@ class OrganizationStorageDashboard(LoginRequiredMixin, TitleMixin, AdminOrganiza
             data_size=Coalesce(F('data_files__zipfile_size'), Value(0)),
         ).only(
             'code', 'name',
-        ).order_by('-data_size')
+        ).prefetch_related('authors__user', 'curators__user')
 
-        return queryset
+        # Annotate with the latest submission date
+
+        last_sub_query = Submission.objects.filter(problem=OuterRef('pk')).order_by('-date').values('date')[:1]
+        queryset = queryset.annotate(last_submission_date=Subquery(last_sub_query))
+
+        # Filter by author
+        author_id = self.request.GET.get('author')
+        if author_id:
+            try:
+                author_id = int(author_id)
+                if self.organization.admins.filter(id=author_id).exists():
+                    queryset = queryset.filter(Q(authors__id=author_id) | Q(curators__id=author_id))
+            except ValueError:
+                pass
+
+        # Filter by last submission time (after / before / never)
+        if self.request.GET.get('no_submission'):
+            queryset = queryset.filter(last_submission_date__isnull=True)
+        else:
+            for key, lookup, time_val in [('last_sub_after', '__gte', datetime.time.min),
+                                          ('last_sub_before', '__lte', datetime.time.max)]:
+                val = self.request.GET.get(key)
+                if val:
+                    try:
+                        date_val = parse_date(val)
+                        if date_val:
+                            dt_val = timezone.make_aware(datetime.datetime.combine(date_val, time_val))
+                            queryset = queryset.filter(**{f'last_submission_date{lookup}': dt_val})
+                    except ValueError:
+                        pass
+
+        return queryset.order_by('-data_size', 'id')
+
+    def _get_storage_pie_charts(self, now):
+        org = self.organization
+
+        def ago(days):
+            return now - datetime.timedelta(days=days)
+
+        bucket_ranges = [
+            (None, None),
+            (ago(365), None),
+            (ago(274), ago(365)),
+            (ago(183), ago(274)),
+            (ago(91), ago(183)),
+            (now, ago(91)),
+        ]
+
+        cache = storage_pie_cache_factory(org.id)
+        raw = cache.get_cache()
+        if raw is None:
+            all_problems = Problem.available.filter(organization=org).annotate(
+                data_size=Coalesce(F('data_files__zipfile_size'), Value(0)),
+            )
+            last_sub_qs = Submission.objects.filter(
+                problem=OuterRef('pk'),
+            ).order_by('-date').values('date')[:1]
+            all_problems = all_problems.annotate(last_submission_date=Subquery(last_sub_qs))
+
+            raw = []
+            for after, before in bucket_ranges:
+                if after is None:
+                    qs = all_problems.filter(last_submission_date__isnull=True)
+                else:
+                    filters = {'last_submission_date__lte': after}
+                    if before is not None:
+                        filters['last_submission_date__gt'] = before
+                    qs = all_problems.filter(**filters)
+                agg = qs.aggregate(cnt=Count('id'), total=Coalesce(Sum('data_size'), Value(0)))
+                raw.append((agg['cnt'], agg['total']))
+            cache.set_cache(raw)
+
+        label_threshold = _('Last submission %(months)d+ months ago')
+        label_range = _('Last submission %(from)d-%(to)d months ago')
+        label_recent = _('Last submission < %(months)d months ago')
+        labels = [
+            _('No submissions'),
+            label_threshold % {'months': 12},
+            label_range % {'from': 9, 'to': 12},
+            label_range % {'from': 6, 'to': 9},
+            label_range % {'from': 3, 'to': 6},
+            label_recent % {'months': 3},
+        ]
+
+        total_cnt = sum(r[0] for r in raw) or 1
+        total_size = sum(r[1] for r in raw) or 1
+
+        count_data, size_data = [], []
+        for label, (cnt, size) in zip(labels, raw):
+            cnt_pct = round(cnt / total_cnt * 100)
+            size_pct = round(size / total_size * 100)
+            count_data.append(('{} ({}%, {} {})'.format(label, cnt_pct, cnt, _('problems')), cnt))
+            size_data.append(('{} ({}%, {})'.format(label, size_pct, filesizeformat(size)), size))
+
+        return get_pie_chart(count_data), get_pie_chart(size_data)
 
     def get_context_data(self, **kwargs):
         context = super().get_context_data(**kwargs)
 
-        cache_factory = cache_helper.organization_storage_cache_factory(self.organization.id)
-        cached_data = cache_factory.get_cache()
+        org = self.organization
+        add_quota_context(org, context)
 
-        if cached_data is None:
-            storage_totals = ProblemData.objects.filter(
-                problem__organization=self.organization,
-            ).aggregate(
-                test_data=Sum('zipfile_size'),
-            )
+        today = timezone.now()
+        context['active_quotas'] = list(
+            org.quotas.filter(start_date__lte=today.date(), end_date__gte=today.date()).order_by('end_date'),
+        )
 
-            test_data_total = storage_totals['test_data'] or 0
+        context['storage_count_chart'], context['storage_size_chart'] = self._get_storage_pie_charts(today)
 
-            cached_data = {
-                'test_data': test_data_total,
-            }
+        # Credit/cost chart context (merged from usage page)
+        usages = OrganizationMonthlyUsage.objects.filter(organization=org) \
+            .order_by('time').values('time', 'consumed_credit')
+        context['usages'] = usages
+        days = [usage['time'].isoformat() for usage in usages] + [_('Current month')]
+        used_credits = [usage['consumed_credit'] for usage in usages] + [org.current_consumed_credit]
+        sec_per_hour = 60 * 60
+        context['credit_chart'] = get_lines_chart(days, {
+            _('Credit usage (hour)'): [round(c / sec_per_hour, 2) for c in used_credits],
+        })
+        context['cost_chart'] = get_lines_chart(days, {
+            _('Cost (thousand vnd)'): [
+                round(max(0, c - settings.VNOJ_MONTHLY_FREE_CREDIT) / sec_per_hour * settings.VNOJ_PRICE_PER_HOUR, 3)
+                for c in used_credits
+            ],
+        })
+        free_credit = int(org.free_credit)
+        context['free_credit'] = {
+            'hour': free_credit // sec_per_hour,
+            'minute': (free_credit % sec_per_hour) // 60,
+            'second': free_credit % 60,
+        }
+        paid_credit = int(org.paid_credit)
+        context['paid_credit'] = {
+            'hour': paid_credit // sec_per_hour,
+            'minute': (paid_credit % sec_per_hour) // 60,
+            'second': paid_credit % 60,
+        }
 
-            cache_factory.set_cache(cached_data)
-
-        context['test_data_storage'] = cached_data['test_data']
+        context['org_admins'] = org.admins.select_related('user')
+        context['selected_author'] = self.request.GET.get('author')
+        context['last_sub_after'] = self.request.GET.get('last_sub_after')
+        context['last_sub_before'] = self.request.GET.get('last_sub_before')
 
         context.update(paginate_query_context(self.request))
 
